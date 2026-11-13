@@ -4,6 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT || 3000);
+const HOST = '0.0.0.0';
 const ROOT = path.join(__dirname, 'public');
 const jobs = new Map();
 const queue = [];
@@ -12,8 +13,7 @@ function json(res, status, body) {
   const data = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    // L’extension appelle le serveur depuis une origine chrome-extension://.
-    // Le serveur reste limité à 127.0.0.1, donc * n’expose pas le service sur Internet.
+    // API publique accessible depuis une extension web.
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
@@ -41,7 +41,7 @@ function serveFile(req, res) {
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return json(res, 204, {});
   try {
-    if (req.method === 'GET' && req.url === '/api/health') {
+    if (req.method === 'GET' && (req.url === '/health' || req.url === '/api/health')) {
       return json(res, 200, { ok: true, service: 'gemini-local-bridge', time: new Date().toISOString() });
     }
     if (req.method === 'POST' && req.url === '/api/analyze') {
@@ -73,4 +73,4 @@ const server = http.createServer(async (req, res) => {
     return json(res, 404, { error: 'Route introuvable' });
   } catch (e) { json(res, 400, { error: e.message }); }
 });
-server.listen(PORT, '127.0.0.1', () => console.log(`Gemini Local Bridge: http://127.0.0.1:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`Gemini Local Bridge: listening on ${HOST}:${PORT}`));
