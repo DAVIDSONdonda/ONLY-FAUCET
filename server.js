@@ -1,153 +1,103 @@
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const express = require('express');
+const cors = require('cors');
 const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT || 3000);
-const HOST = '0.0.0.0';
-const API_TOKEN = process.env.API_TOKEN;
-const ROOT = path.join(__dirname, 'public');
+const app = express();
+const PORT = process.env.PORT || 3000;
 const jobs = new Map();
 const queue = [];
 
-function json(res, status, body) {
-  const data = JSON.stringify(body);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+// Comme HCAPTCHA, l’API est publique et accessible depuis une extension web.
+app.use(cors());
+app.use(express.json({ limit: '15mb' }));
+
+app.get('/', (req, res) => {
+  res.json({
+    service: 'gemini-local-bridge',
+    status: 'ok',
+    health: '/health'
   });
-  res.end(data);
-}
-
-function hasValidToken(req) {
-  const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
-  if (!API_TOKEN || !match) return false;
-
-  const supplied = Buffer.from(match[1]);
-  const expected = Buffer.from(API_TOKEN);
-  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = '';
-    let size = 0;
-    req.on('data', chunk => {
-      size += chunk.length;
-      if (size > 15 * 1024 * 1024) {
-        reject(new Error('Payload trop volumineux'));
-        req.destroy();
-      } else {
-        raw += chunk;
-      }
-    });
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(raw || '{}'));
-      } catch {
-        reject(new Error('JSON invalide'));
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
-function serveFile(req, res) {
-  const requested = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-  const file = path.normalize(path.join(ROOT, requested));
-  if (!file.startsWith(ROOT)) return json(res, 403, { error: 'Interdit' });
-  fs.readFile(file, (err, data) => {
-    if (err) return json(res, 404, { error: 'Introuvable' });
-    const ext = path.extname(file);
-    const types = {
-      '.html': 'text/html; charset=utf-8',
-      '.js': 'text/javascript; charset=utf-8',
-      '.css': 'text/css; charset=utf-8'
-    };
-    res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
-    res.end(data);
-  });
-}
-
-const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') return json(res, 204, {});
-
-  try {
-    const isHealthCheck = req.method === 'GET' && req.url === '/api/health';
-    if (req.url.startsWith('/api/') && !isHealthCheck && !hasValidToken(req)) {
-      return json(res, 401, { error: 'Authentification requise' });
-    }
-
-    if (isHealthCheck) {
-      return json(res, 200, {
-        ok: true,
-        service: 'gemini-local-bridge',
-        time: new Date().toISOString()
-      });
-    }
-
-    if (req.method === 'POST' && req.url === '/api/analyze') {
-      const body = await readBody(req);
-      if (!body.prompt || !body.imageDataUrl) {
-        return json(res, 400, { error: 'prompt et imageDataUrl sont requis' });
-      }
-      const id = crypto.randomUUID();
-      jobs.set(id, {
-        id,
-        prompt: String(body.prompt),
-        imageDataUrl: String(body.imageDataUrl),
-        status: 'queued',
-        createdAt: Date.now()
-      });
-      queue.push(id);
-      return json(res, 202, { id, status: 'queued' });
-    }
-
-    if (req.method === 'GET' && req.url === '/api/next') {
-      const id = queue.shift();
-      if (!id) return json(res, 204, {});
-      const job = jobs.get(id);
-      job.status = 'processing';
-      return json(res, 200, {
-        id: job.id,
-        prompt: job.prompt,
-        imageDataUrl: job.imageDataUrl
-      });
-    }
-
-    if (req.method === 'POST' && req.url.startsWith('/api/result/')) {
-      const id = req.url.split('/').pop();
-      const body = await readBody(req);
-      const job = jobs.get(id);
-      if (!job) return json(res, 404, { error: 'Job introuvable' });
-      job.status = body.error ? 'error' : 'done';
-      job.response = body.response || null;
-      job.error = body.error || null;
-      job.updatedAt = Date.now();
-      return json(res, 200, { ok: true });
-    }
-
-    if (req.method === 'GET' && req.url.startsWith('/api/status/')) {
-      const id = req.url.split('/').pop();
-      const job = jobs.get(id);
-      if (!job) return json(res, 404, { error: 'Job introuvable' });
-      return json(res, 200, {
-        id,
-        status: job.status,
-        response: job.response || null,
-        error: job.error || null
-      });
-    }
-
-    if (req.method === 'GET') return serveFile(req, res);
-    return json(res, 404, { error: 'Route introuvable' });
-  } catch (e) {
-    json(res, 400, { error: e.message });
-  }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Gemini Local Bridge: listening on ${HOST}:${PORT}`);
+// Render peut utiliser /health comme health check ; /api/health reste disponible.
+function healthCheck(req, res) {
+  res.json({
+    status: 'ok',
+    service: 'gemini-local-bridge',
+    timestamp: new Date().toISOString()
+  });
+}
+app.get('/health', healthCheck);
+app.get('/api/health', healthCheck);
+
+app.post('/api/analyze', (req, res) => {
+  const { prompt, imageDataUrl } = req.body || {};
+  if (!prompt || !imageDataUrl) {
+    return res.status(400).json({ error: 'prompt et imageDataUrl sont requis' });
+  }
+
+  const id = crypto.randomUUID();
+  jobs.set(id, {
+    id,
+    prompt: String(prompt),
+    imageDataUrl: String(imageDataUrl),
+    status: 'queued',
+    createdAt: Date.now()
+  });
+  queue.push(id);
+  return res.status(202).json({ id, status: 'queued' });
+});
+
+app.get('/api/next', (req, res) => {
+  const id = queue.shift();
+  if (!id) return res.status(204).end();
+
+  const job = jobs.get(id);
+  if (!job) return res.status(404).json({ error: 'Job introuvable' });
+  job.status = 'processing';
+  return res.json({
+    id: job.id,
+    prompt: job.prompt,
+    imageDataUrl: job.imageDataUrl
+  });
+});
+
+app.post('/api/result/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job introuvable' });
+
+  const body = req.body || {};
+  job.status = body.error ? 'error' : 'done';
+  job.response = body.response || null;
+  job.error = body.error || null;
+  job.updatedAt = Date.now();
+  return res.json({ ok: true });
+});
+
+app.get('/api/status/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job introuvable' });
+
+  return res.json({
+    id: job.id,
+    status: job.status,
+    response: job.response || null,
+    error: job.error || null
+  });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route introuvable' });
+});
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = err.status === 413 ? 413 : 400;
+  const message = status === 413 ? 'Payload trop volumineux' : 'JSON invalide';
+  return res.status(status).json({ error: message });
+});
+
+// app.listen(PORT) écoute sur toutes les interfaces, comme le serveur HCAPTCHA.
+app.listen(PORT, () => {
+  console.log(`Gemini Local Bridge démarré sur le port ${PORT}`);
 });
