@@ -7,7 +7,6 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const ROOT = path.join(__dirname, 'public');
 
-// Stockage en mémoire
 const jobs = new Map();
 let extensionSocket = null;
 let mobileSocket = null;
@@ -20,7 +19,6 @@ const server = http.createServer((req, res) => {
     return;
   }
   
-  // Fichiers statiques éventuels
   const file = path.normalize(path.join(ROOT, requested));
   if (!file.startsWith(ROOT)) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -38,7 +36,6 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// Création du serveur WebSocket par-dessus HTTP
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
@@ -48,17 +45,13 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
 
-      // 1. L'extension s'enregistre et envoie une nouvelle tâche avec l'image
       if (data.type === 'register_extension') {
         extensionSocket = ws;
         console.log('[WS] Extension Chrome enregistrée');
       }
-      
-      // 2. L'application mobile s'enregistre
       else if (data.type === 'register_mobile') {
         mobileSocket = ws;
         console.log('[WS] Application mobile Android enregistrée');
-        // S'il y a une tâche en attente, on l'envoie tout de suite au mobile
         for (const [id, job] of jobs.entries()) {
           if (job.status === 'queued') {
             job.status = 'processing';
@@ -67,22 +60,17 @@ wss.on('connection', (ws) => {
           }
         }
       }
-
-      // 3. L'extension crée une tâche d'analyse
       else if (data.type === 'analyze_image') {
         const id = 'job_' + Date.now();
         const job = { id, prompt: data.prompt, imageDataUrl: data.imageDataUrl, status: 'queued' };
         jobs.set(id, job);
         console.log(`[WS] Nouvelle tâche reçue de l'extension : ${id}`);
 
-        // Transmettre immédiatement au mobile s'il est connecté
         if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
           job.status = 'processing';
           mobileSocket.send(JSON.stringify({ type: 'new_job', id: job.id, imageDataUrl: job.imageDataUrl }));
         }
       }
-
-      // 4. Le mobile renvoie le résultat de la résolution
       else if (data.type === 'submit_result') {
         const { id, response } = data;
         const job = jobs.get(id);
@@ -91,14 +79,12 @@ wss.on('connection', (ws) => {
           job.response = response;
           console.log(`[WS] Résultat reçu pour ${id} :`, response);
 
-          // Transmettre instantanément la réponse à l'extension Chrome
           if (extensionSocket && extensionSocket.readyState === WebSocket.OPEN) {
             extensionSocket.send(JSON.stringify({ type: 'job_result', id, response }));
           }
-          jobs.delete(id); // Nettoyage
+          jobs.delete(id);
         }
       }
-
     } catch (e) {
       console.error('[WS] Erreur de traitement du message :', e.message);
     }
