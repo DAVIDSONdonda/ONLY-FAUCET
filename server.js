@@ -1,76 +1,121 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const ROOT = path.join(__dirname, 'public');
-const jobs = new Map();
-const queue = [];
 
-function json(res, status, body) {
-  const data = JSON.stringify(body);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    // API publique accessible depuis une extension web.
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
-  });
-  res.end(data);
-}
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = ''; let size = 0;
-    req.on('data', chunk => { size += chunk.length; if (size > 15 * 1024 * 1024) { reject(new Error('Payload trop volumineux')); req.destroy(); } else raw += chunk; });
-    req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { reject(new Error('JSON invalide')); } });
-    req.on('error', reject);
-  });
-}
-function serveFile(req, res) {
+// Stockage en mémoire
+const jobs = new Map();
+let extensionSocket = null;
+let mobileSocket = null;
+
+const server = http.createServer((req, res) => {
   const requested = req.url === '/' ? '/index.html' : req.url.split('?')[0];
+  if (requested === '/health' || requested === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ ok: true, service: 'gemini-websocket-bridge', time: new Date().toISOString() }));
+    return;
+  }
+  
+  // Fichiers statiques éventuels
   const file = path.normalize(path.join(ROOT, requested));
-  if (!file.startsWith(ROOT)) return json(res, 403, { error: 'Interdit' });
+  if (!file.startsWith(ROOT)) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Interdit' }));
+    return;
+  }
   fs.readFile(file, (err, data) => {
-    if (err) return json(res, 404, { error: 'Introuvable' });
-    const ext = path.extname(file); const types = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8' };
-    res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' }); res.end(data);
+    if (err) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Introuvable' }));
+      return;
+    }
+    res.writeHead(200);
+    res.end(data);
   });
-}
-const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') return json(res, 204, {});
-  try {
-    if (req.method === 'GET' && (req.url === '/health' || req.url === '/api/health')) {
-      return json(res, 200, { ok: true, service: 'gemini-local-bridge', time: new Date().toISOString() });
-    }
-    if (req.method === 'POST' && req.url === '/api/analyze') {
-      const body = await readBody(req);
-      if (!body.prompt || !body.imageDataUrl) return json(res, 400, { error: 'prompt et imageDataUrl sont requis' });
-      const id = crypto.randomUUID();
-      jobs.set(id, { id, prompt: String(body.prompt), imageDataUrl: String(body.imageDataUrl), status: 'queued', createdAt: Date.now() });
-      queue.push(id);
-      return json(res, 202, { id, status: 'queued' });
-    }
-    if (req.method === 'GET' && req.url === '/api/next') {
-      const id = queue.shift();
-      if (!id) return json(res, 204, {});
-      const job = jobs.get(id); job.status = 'processing';
-      return json(res, 200, { id: job.id, prompt: job.prompt, imageDataUrl: job.imageDataUrl });
-    }
-    if (req.method === 'POST' && req.url.startsWith('/api/result/')) {
-      const id = req.url.split('/').pop(); const body = await readBody(req); const job = jobs.get(id);
-      if (!job) return json(res, 404, { error: 'Job introuvable' });
-      job.status = body.error ? 'error' : 'done'; job.response = body.response || null; job.error = body.error || null; job.updatedAt = Date.now();
-      return json(res, 200, { ok: true });
-    }
-    if (req.method === 'GET' && req.url.startsWith('/api/status/')) {
-      const id = req.url.split('/').pop(); const job = jobs.get(id);
-      if (!job) return json(res, 404, { error: 'Job introuvable' });
-      return json(res, 200, { id, status: job.status, response: job.response || null, error: job.error || null });
-    }
-    if (req.method === 'GET') return serveFile(req, res);
-    return json(res, 404, { error: 'Route introuvable' });
-  } catch (e) { json(res, 400, { error: e.message }); }
 });
-server.listen(PORT, HOST, () => console.log(`Gemini Local Bridge: listening on ${HOST}:${PORT}`));
+
+// Création du serveur WebSocket par-dessus HTTP
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  console.log('[WS] Nouveau client connecté');
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+
+      // 1. L'extension s'enregistre et envoie une nouvelle tâche avec l'image
+      if (data.type === 'register_extension') {
+        extensionSocket = ws;
+        console.log('[WS] Extension Chrome enregistrée');
+      }
+      
+      // 2. L'application mobile s'enregistre
+      else if (data.type === 'register_mobile') {
+        mobileSocket = ws;
+        console.log('[WS] Application mobile Android enregistrée');
+        // S'il y a une tâche en attente, on l'envoie tout de suite au mobile
+        for (const [id, job] of jobs.entries()) {
+          if (job.status === 'queued') {
+            job.status = 'processing';
+            ws.send(JSON.stringify({ type: 'new_job', id: job.id, imageDataUrl: job.imageDataUrl }));
+            break;
+          }
+        }
+      }
+
+      // 3. L'extension crée une tâche d'analyse
+      else if (data.type === 'analyze_image') {
+        const id = 'job_' + Date.now();
+        const job = { id, prompt: data.prompt, imageDataUrl: data.imageDataUrl, status: 'queued' };
+        jobs.set(id, job);
+        console.log(`[WS] Nouvelle tâche reçue de l'extension : ${id}`);
+
+        // Transmettre immédiatement au mobile s'il est connecté
+        if (mobileSocket && mobileSocket.readyState === WebSocket.OPEN) {
+          job.status = 'processing';
+          mobileSocket.send(JSON.stringify({ type: 'new_job', id: job.id, imageDataUrl: job.imageDataUrl }));
+        }
+      }
+
+      // 4. Le mobile renvoie le résultat de la résolution
+      else if (data.type === 'submit_result') {
+        const { id, response } = data;
+        const job = jobs.get(id);
+        if (job) {
+          job.status = 'done';
+          job.response = response;
+          console.log(`[WS] Résultat reçu pour ${id} :`, response);
+
+          // Transmettre instantanément la réponse à l'extension Chrome
+          if (extensionSocket && extensionSocket.readyState === WebSocket.OPEN) {
+            extensionSocket.send(JSON.stringify({ type: 'job_result', id, response }));
+          }
+          jobs.delete(id); // Nettoyage
+        }
+      }
+
+    } catch (e) {
+      console.error('[WS] Erreur de traitement du message :', e.message);
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws === extensionSocket) {
+      extensionSocket = null;
+      console.log('[WS] Extension Chrome déconnectée');
+    }
+    if (ws === mobileSocket) {
+      mobileSocket = null;
+      console.log('[WS] Application mobile déconnectée');
+    }
+  });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Serveur WebSocket & HTTP démarré sur ${HOST}:${PORT}`);
+});
