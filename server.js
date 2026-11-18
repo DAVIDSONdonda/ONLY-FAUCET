@@ -7,9 +7,12 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const ROOT = path.join(__dirname, 'public');
 
+// Les Map conservent l’ordre d’insertion : la première tâche est toujours servie en premier.
 const jobs = new Map();
-let extensionSocket = null;
-let mobileSocket = null;
+const mobileClients = new Map();
+const extensionClients = new Set();
+
+let nextMobileNumber = 1;
 
 function sendJson(ws, payload) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -19,24 +22,81 @@ function sendJson(ws, payload) {
   return false;
 }
 
-function sendNextQueuedJob() {
-  if (!mobileSocket || mobileSocket.readyState !== WebSocket.OPEN) {
+function activeJobExists() {
+  for (const job of jobs.values()) {
+    if (job.status === 'processing') return true;
+  }
+  return false;
+}
+
+function getFirstQueuedJob() {
+  for (const job of jobs.values()) {
+    if (job.status === 'queued') return job;
+  }
+  return null;
+}
+
+function getFreeMobile() {
+  for (const client of mobileClients.values()) {
+    if (
+      client.ws.readyState === WebSocket.OPEN &&
+      client.currentJobId === null
+    ) {
+      return client;
+    }
+  }
+  return null;
+}
+
+// Traitement volontairement séquentiel : une seule tâche active à la fois.
+function dispatchNextJob() {
+  if (activeJobExists()) return;
+
+  const job = getFirstQueuedJob();
+  if (!job) return;
+
+  const mobile = getFreeMobile();
+  if (!mobile) return;
+
+  job.status = 'processing';
+  job.mobileId = mobile.id;
+  job.mobileSocket = mobile.ws;
+  job.startedAt = new Date().toISOString();
+  mobile.currentJobId = job.id;
+
+  const sent = sendJson(mobile.ws, {
+    type: 'new_job',
+    id: job.id,
+    prompt: job.prompt,
+    imageDataUrl: job.imageDataUrl,
+    queuePosition: 1
+  });
+
+  if (!sent) {
+    job.status = 'queued';
+    job.mobileId = null;
+    job.mobileSocket = null;
+    job.startedAt = null;
+    mobile.currentJobId = null;
     return;
   }
 
-  for (const [id, job] of jobs.entries()) {
-    if (job.status === 'queued') {
-      job.status = 'processing';
-      sendJson(mobileSocket, {
-        type: 'new_job',
-        id: job.id,
-        prompt: job.prompt,
-        imageDataUrl: job.imageDataUrl
-      });
-      console.log(`[WS] Tâche envoyée à Android : ${id}`);
-      return;
-    }
+  console.log(`[QUEUE] Tâche ${job.id} envoyée à ${mobile.id}`);
+}
+
+function queueStats() {
+  let queued = 0;
+  let processing = 0;
+  for (const job of jobs.values()) {
+    if (job.status === 'queued') queued++;
+    if (job.status === 'processing') processing++;
   }
+  return {
+    queued,
+    processing,
+    connectedMobiles: mobileClients.size,
+    connectedExtensions: extensionClients.size
+  };
 }
 
 const server = http.createServer((req, res) => {
@@ -50,9 +110,9 @@ const server = http.createServer((req, res) => {
     });
     res.end(JSON.stringify({
       ok: true,
-      service: 'gemini-websocket-bridge',
+      service: 'gemini-websocket-queue-bridge',
       time: new Date().toISOString(),
-      queuedJobs: [...jobs.values()].filter(job => job.status === 'queued').length
+      ...queueStats()
     }));
     return;
   }
@@ -90,8 +150,9 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   console.log('[WS] Nouveau client connecté');
   ws.isAlive = true;
+  ws.clientType = null;
+  ws.mobileId = null;
 
-  // Utilisé par le heartbeat WebSocket du serveur.
   ws.on('pong', () => {
     ws.isAlive = true;
   });
@@ -100,8 +161,6 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message.toString());
 
-      // Le client doit envoyer ce message périodiquement.
-      // Cela maintient une activité entrante sur Render Free.
       if (data.type === 'ping') {
         sendJson(ws, {
           type: 'pong',
@@ -111,23 +170,39 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'register_extension') {
-        if (extensionSocket && extensionSocket !== ws) {
-          extensionSocket.close(1000, 'Nouvelle extension connectée');
-        }
-        extensionSocket = ws;
-        console.log('[WS] Extension Chrome enregistrée');
-        sendJson(ws, { type: 'registered', client: 'extension' });
+        ws.clientType = 'extension';
+        extensionClients.add(ws);
+        console.log(`[WS] Extension enregistrée (${extensionClients.size} connectées)`);
+        sendJson(ws, {
+          type: 'registered',
+          client: 'extension',
+          queue: queueStats()
+        });
         return;
       }
 
       if (data.type === 'register_mobile') {
-        if (mobileSocket && mobileSocket !== ws) {
-          mobileSocket.close(1000, 'Nouvelle application mobile connectée');
-        }
-        mobileSocket = ws;
-        console.log('[WS] Application mobile Android enregistrée');
-        sendJson(ws, { type: 'registered', client: 'mobile' });
-        sendNextQueuedJob();
+        const mobileId = `mobile_${nextMobileNumber++}`;
+        const mobile = {
+          id: mobileId,
+          ws,
+          currentJobId: null,
+          connectedAt: new Date().toISOString()
+        };
+
+        ws.clientType = 'mobile';
+        ws.mobileId = mobileId;
+        mobileClients.set(mobileId, mobile);
+
+        console.log(`[WS] ${mobileId} enregistré (${mobileClients.size} appareils connectés)`);
+        sendJson(ws, {
+          type: 'registered',
+          client: 'mobile',
+          mobileId,
+          queue: queueStats()
+        });
+
+        dispatchNextJob();
         return;
       }
 
@@ -146,18 +221,24 @@ wss.on('connection', (ws) => {
           prompt: data.prompt || '',
           imageDataUrl: data.imageDataUrl,
           status: 'queued',
-          createdAt: new Date().toISOString()
+          extensionSocket: ws,
+          mobileSocket: null,
+          mobileId: null,
+          createdAt: new Date().toISOString(),
+          startedAt: null
         };
 
         jobs.set(id, job);
-        console.log(`[WS] Nouvelle tâche reçue de l’extension : ${id}`);
+        console.log(`[QUEUE] Nouvelle tâche ${id}. File : ${queueStats().queued}`);
 
         sendJson(ws, {
           type: 'job_accepted',
           id,
-          status: job.status
+          status: 'queued',
+          queue: queueStats()
         });
-        sendNextQueuedJob();
+
+        dispatchNextJob();
         return;
       }
 
@@ -169,25 +250,41 @@ wss.on('connection', (ws) => {
           sendJson(ws, {
             type: 'error',
             id,
-            error: 'Tâche introuvable ou déjà supprimée'
+            error: 'Tâche introuvable ou déjà terminée'
+          });
+          return;
+        }
+
+        if (job.mobileSocket !== ws) {
+          sendJson(ws, {
+            type: 'error',
+            id,
+            error: 'Cette tâche est attribuée à un autre appareil'
           });
           return;
         }
 
         job.status = 'done';
-        job.response = response;
+        job.response = response || '';
         job.completedAt = new Date().toISOString();
-        console.log(`[WS] Résultat reçu pour ${id}`);
 
-        sendJson(extensionSocket, {
+        const mobile = mobileClients.get(job.mobileId);
+        if (mobile && mobile.currentJobId === id) {
+          mobile.currentJobId = null;
+        }
+
+        // Le résultat est envoyé uniquement à l’extension qui a créé la tâche.
+        sendJson(job.extensionSocket, {
           type: 'job_result',
           id,
-          response
+          response: job.response
         });
 
-        // La tâche n’est plus nécessaire après l’envoi du résultat.
+        console.log(`[QUEUE] Tâche ${id} terminée par ${job.mobileId}`);
         jobs.delete(id);
-        sendNextQueuedJob();
+
+        // La tâche suivante est envoyée immédiatement au prochain appareil libre.
+        dispatchNextJob();
         return;
       }
 
@@ -196,7 +293,7 @@ wss.on('connection', (ws) => {
         error: `Type de message inconnu : ${data.type || 'absent'}`
       });
     } catch (error) {
-      console.error('[WS] Erreur de traitement du message :', error.message);
+      console.error('[WS] Erreur de traitement :', error.message);
       sendJson(ws, {
         type: 'error',
         error: 'Message JSON invalide'
@@ -205,21 +302,29 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    if (ws === extensionSocket) {
-      extensionSocket = null;
-      console.log('[WS] Extension Chrome déconnectée');
+    if (ws.clientType === 'extension') {
+      extensionClients.delete(ws);
+      for (const job of jobs.values()) {
+        if (job.extensionSocket === ws) job.extensionSocket = null;
+      }
+      console.log(`[WS] Extension déconnectée (${extensionClients.size} restantes)`);
     }
 
-    if (ws === mobileSocket) {
-      mobileSocket = null;
-      console.log('[WS] Application mobile déconnectée');
-
-      // Une tâche en cours pourra être renvoyée au prochain mobile connecté.
-      for (const job of jobs.values()) {
-        if (job.status === 'processing') {
+    if (ws.clientType === 'mobile' && ws.mobileId) {
+      const mobile = mobileClients.get(ws.mobileId);
+      if (mobile?.currentJobId) {
+        const job = jobs.get(mobile.currentJobId);
+        if (job && job.status === 'processing') {
           job.status = 'queued';
+          job.mobileId = null;
+          job.mobileSocket = null;
+          job.startedAt = null;
+          console.log(`[QUEUE] Tâche ${job.id} remise en file après déconnexion de ${ws.mobileId}`);
         }
       }
+      mobileClients.delete(ws.mobileId);
+      console.log(`[WS] ${ws.mobileId} déconnecté (${mobileClients.size} restants)`);
+      dispatchNextJob();
     }
   });
 
@@ -228,24 +333,19 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Vérifie régulièrement que les connexions WebSocket sont encore vivantes.
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
       ws.terminate();
       return;
     }
-
     ws.isAlive = false;
     ws.ping();
   });
 }, 30000);
 
-wss.on('close', () => {
-  clearInterval(heartbeatInterval);
-});
+wss.on('close', () => clearInterval(heartbeatInterval));
 
 server.listen(PORT, HOST, () => {
-  console.log(`Serveur WebSocket & HTTP démarré sur ${HOST}:${PORT}`);
+  console.log(`Serveur WebSocket FIFO démarré sur ${HOST}:${PORT}`);
 });
-
