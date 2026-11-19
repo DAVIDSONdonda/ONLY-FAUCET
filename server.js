@@ -12,6 +12,7 @@ const JOB_TTL_MS = 2 * 60 * 1000;
 const jobs = new Map();
 const mobileClients = new Map();
 const extensionClients = new Set();
+const expiredJobTargets = new Map();
 
 let nextMobileNumber = 1;
 
@@ -41,7 +42,8 @@ function getFreeMobile() {
   for (const client of mobileClients.values()) {
     if (
       client.ws.readyState === WebSocket.OPEN &&
-      client.currentJobId === null
+      client.currentJobId === null &&
+      client.awaitingReload === false
     ) {
       return client;
     }
@@ -104,9 +106,23 @@ function expireJob(jobId) {
   const job = jobs.get(jobId);
   if (!job) return;
 
+  if (job.extensionSocket && job.extensionTabId != null) {
+    const target = {
+      socket: job.extensionSocket,
+      tabId: job.extensionTabId
+    };
+    expiredJobTargets.set(job.id, target);
+    setTimeout(() => {
+      if (expiredJobTargets.get(job.id) === target) {
+        expiredJobTargets.delete(job.id);
+      }
+    }, 5 * 60 * 1000);
+  }
+
   const mobile = job.mobileId ? mobileClients.get(job.mobileId) : null;
   if (mobile && mobile.currentJobId === job.id) {
     mobile.currentJobId = null;
+    mobile.awaitingReload = true;
   }
 
   sendJson(job.extensionSocket, {
@@ -214,6 +230,7 @@ wss.on('connection', (ws) => {
           id: mobileId,
           ws,
           currentJobId: null,
+          awaitingReload: false,
           connectedAt: new Date().toISOString()
         };
 
@@ -249,6 +266,7 @@ wss.on('connection', (ws) => {
           imageDataUrl: data.imageDataUrl,
           status: 'queued',
           extensionSocket: ws,
+          extensionTabId: Number.isInteger(data.tabId) ? data.tabId : null,
           mobileSocket: null,
           mobileId: null,
           createdAt: new Date().toISOString(),
@@ -314,6 +332,30 @@ wss.on('connection', (ws) => {
         jobs.delete(id);
 
         // La tâche suivante est envoyée immédiatement au prochain appareil libre.
+        dispatchNextJob();
+        return;
+      }
+
+      if (data.type === 'reload_extension_page') {
+        const target = expiredJobTargets.get(data.id);
+        if (!target || target.socket.readyState !== WebSocket.OPEN) {
+          sendJson(ws, {
+            type: 'error',
+            id: data.id,
+            error: 'Extension introuvable pour cette tâche expirée'
+          });
+          return;
+        }
+
+        sendJson(target.socket, {
+          type: 'reload_page',
+          id: data.id,
+          tabId: target.tabId
+        });
+        expiredJobTargets.delete(data.id);
+        const mobile = mobileClients.get(ws.mobileId);
+        if (mobile) mobile.awaitingReload = false;
+        sendJson(ws, { type: 'reload_requested', id: data.id });
         dispatchNextJob();
         return;
       }
