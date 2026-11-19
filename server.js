@@ -6,6 +6,7 @@ const { WebSocketServer, WebSocket } = require('ws');
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const ROOT = path.join(__dirname, 'public');
+const JOB_TTL_MS = 2 * 60 * 1000;
 
 // Les Map conservent l’ordre d’insertion : la première tâche est toujours servie en premier.
 const jobs = new Map();
@@ -97,6 +98,32 @@ function queueStats() {
     connectedMobiles: mobileClients.size,
     connectedExtensions: extensionClients.size
   };
+}
+
+function expireJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  const mobile = job.mobileId ? mobileClients.get(job.mobileId) : null;
+  if (mobile && mobile.currentJobId === job.id) {
+    mobile.currentJobId = null;
+  }
+
+  sendJson(job.extensionSocket, {
+    type: 'job_expired',
+    id: job.id,
+    error: 'La tâche a expiré après 2 minutes.'
+  });
+
+  sendJson(job.mobileSocket, {
+    type: 'job_expired',
+    id: job.id,
+    error: 'La tâche a expiré après 2 minutes.'
+  });
+
+  console.log(`[QUEUE] Tâche ${job.id} expirée après 2 minutes`);
+  jobs.delete(job.id);
+  dispatchNextJob();
 }
 
 const server = http.createServer((req, res) => {
@@ -225,10 +252,12 @@ wss.on('connection', (ws) => {
           mobileSocket: null,
           mobileId: null,
           createdAt: new Date().toISOString(),
-          startedAt: null
+          startedAt: null,
+          expireTimer: null
         };
 
         jobs.set(id, job);
+        job.expireTimer = setTimeout(() => expireJob(id), JOB_TTL_MS);
         console.log(`[QUEUE] Nouvelle tâche ${id}. File : ${queueStats().queued}`);
 
         sendJson(ws, {
@@ -267,6 +296,7 @@ wss.on('connection', (ws) => {
         job.status = 'done';
         job.response = response || '';
         job.completedAt = new Date().toISOString();
+        clearTimeout(job.expireTimer);
 
         const mobile = mobileClients.get(job.mobileId);
         if (mobile && mobile.currentJobId === id) {
