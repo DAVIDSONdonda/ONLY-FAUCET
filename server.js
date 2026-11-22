@@ -11,6 +11,7 @@ const JOB_TTL_MS = 2 * 60 * 1000;
 // Les Map conservent l’ordre d’insertion : la première tâche est toujours servie en premier.
 const jobs = new Map();
 const mobileClients = new Map();
+const browserWorkers = new Map();
 const extensionClients = new Set();
 const expiredJobTargets = new Map();
 
@@ -38,17 +39,14 @@ function getFirstQueuedJob() {
   return null;
 }
 
-function getFreeMobile() {
-  for (const client of mobileClients.values()) {
-    if (
-      client.ws.readyState === WebSocket.OPEN &&
-      client.currentJobId === null &&
-      client.awaitingReload === false
-    ) {
-      return client;
-    }
+function getFreeWorker(pool) {
+  for (const client of pool.values()) {
+    if (client.ws.readyState === WebSocket.OPEN && client.currentJobId === null && client.awaitingReload === false) return client;
   }
   return null;
+}
+function getFreeMobile() {
+  return getFreeWorker(mobileClients);
 }
 
 // Traitement volontairement séquentiel : une seule tâche active à la fois.
@@ -58,33 +56,35 @@ function dispatchNextJob() {
   const job = getFirstQueuedJob();
   if (!job) return;
 
-  const mobile = getFreeMobile();
-  if (!mobile) return;
+  const pool = job.processingTarget === 'extension' ? browserWorkers : mobileClients;
+  const worker = getFreeWorker(pool);
+  if (!worker) return;
 
   job.status = 'processing';
-  job.mobileId = mobile.id;
-  job.mobileSocket = mobile.ws;
+  job.workerId = worker.id;
+  job.workerSocket = worker.ws;
   job.startedAt = new Date().toISOString();
-  mobile.currentJobId = job.id;
+  worker.currentJobId = job.id;
 
-  const sent = sendJson(mobile.ws, {
+  const sent = sendJson(worker.ws, {
     type: 'new_job',
     id: job.id,
     prompt: job.prompt,
     imageDataUrl: job.imageDataUrl,
-    queuePosition: 1
+    queuePosition: 1,
+    processingTarget: job.processingTarget
   });
 
   if (!sent) {
     job.status = 'queued';
-    job.mobileId = null;
-    job.mobileSocket = null;
+    job.workerId = null;
+    job.workerSocket = null;
     job.startedAt = null;
-    mobile.currentJobId = null;
+    worker.currentJobId = null;
     return;
   }
 
-  console.log(`[QUEUE] Tâche ${job.id} envoyée à ${mobile.id}`);
+  console.log(`[QUEUE] Tâche ${job.id} envoyée à ${worker.id} (${job.processingTarget})`);
 }
 
 function queueStats() {
@@ -98,6 +98,7 @@ function queueStats() {
     queued,
     processing,
     connectedMobiles: mobileClients.size,
+    connectedBrowserWorkers: browserWorkers.size,
     connectedExtensions: extensionClients.size
   };
 }
@@ -119,10 +120,11 @@ function expireJob(jobId) {
     }, 5 * 60 * 1000);
   }
 
-  const mobile = job.mobileId ? mobileClients.get(job.mobileId) : null;
-  if (mobile && mobile.currentJobId === job.id) {
-    mobile.currentJobId = null;
-    mobile.awaitingReload = true;
+  const pool = job.processingTarget === 'extension' ? browserWorkers : mobileClients;
+  const worker = job.workerId ? pool.get(job.workerId) : null;
+  if (worker && worker.currentJobId === job.id) {
+    worker.currentJobId = null;
+    worker.awaitingReload = true;
   }
 
   sendJson(job.extensionSocket, {
@@ -131,7 +133,7 @@ function expireJob(jobId) {
     error: 'La tâche a expiré après 2 minutes.'
   });
 
-  sendJson(job.mobileSocket, {
+  sendJson(job.workerSocket, {
     type: 'job_expired',
     id: job.id,
     error: 'La tâche a expiré après 2 minutes.'
@@ -224,6 +226,17 @@ wss.on('connection', (ws) => {
         return;
       }
 
+      if (data.type === 'register_browser_worker') {
+        const workerId = `browser_${browserWorkers.size + 1}_${Date.now()}`;
+        const worker = { id: workerId, ws, currentJobId: null, awaitingReload: false, connectedAt: new Date().toISOString() };
+        ws.clientType = 'browser_worker';
+        ws.workerId = workerId;
+        browserWorkers.set(workerId, worker);
+        console.log(`[WS] ${workerId} enregistré (${browserWorkers.size} extensions de traitement)`);
+        sendJson(ws, { type: 'registered', client: 'browser_worker', workerId, queue: queueStats() });
+        dispatchNextJob();
+        return;
+      }
       if (data.type === 'register_mobile') {
         const mobileId = `mobile_${nextMobileNumber++}`;
         const mobile = {
@@ -265,10 +278,13 @@ wss.on('connection', (ws) => {
           prompt: data.prompt || '',
           imageDataUrl: data.imageDataUrl,
           status: 'queued',
+          processingTarget: data.processingTarget === 'extension' ? 'extension' : 'mobile',
           extensionSocket: ws,
           extensionTabId: Number.isInteger(data.tabId) ? data.tabId : null,
           mobileSocket: null,
           mobileId: null,
+          workerSocket: null,
+          workerId: null,
           createdAt: new Date().toISOString(),
           startedAt: null,
           expireTimer: null
@@ -302,7 +318,7 @@ wss.on('connection', (ws) => {
           return;
         }
 
-        if (job.mobileSocket !== ws) {
+        if (job.workerSocket !== ws) {
           sendJson(ws, {
             type: 'error',
             id,
@@ -316,10 +332,9 @@ wss.on('connection', (ws) => {
         job.completedAt = new Date().toISOString();
         clearTimeout(job.expireTimer);
 
-        const mobile = mobileClients.get(job.mobileId);
-        if (mobile && mobile.currentJobId === id) {
-          mobile.currentJobId = null;
-        }
+        const pool = job.processingTarget === 'extension' ? browserWorkers : mobileClients;
+        const worker = pool.get(job.workerId);
+        if (worker && worker.currentJobId === id) worker.currentJobId = null;
 
         // Le résultat est envoyé uniquement à l’extension qui a créé la tâche.
         sendJson(job.extensionSocket, {
@@ -328,7 +343,7 @@ wss.on('connection', (ws) => {
           response: job.response
         });
 
-        console.log(`[QUEUE] Tâche ${id} terminée par ${job.mobileId}`);
+        console.log(`[QUEUE] Tâche ${id} terminée par ${job.workerId} (${job.processingTarget})`);
         jobs.delete(id);
 
         // La tâche suivante est envoyée immédiatement au prochain appareil libre.
@@ -353,8 +368,9 @@ wss.on('connection', (ws) => {
           tabId: target.tabId
         });
         expiredJobTargets.delete(data.id);
-        const mobile = mobileClients.get(ws.mobileId);
-        if (mobile) mobile.awaitingReload = false;
+        const workerPool = ws.clientType === 'browser_worker' ? browserWorkers : mobileClients;
+        const worker = ws.workerId ? workerPool.get(ws.workerId) : null;
+        if (worker) worker.awaitingReload = false;
         sendJson(ws, { type: 'reload_requested', id: data.id });
         dispatchNextJob();
         return;
@@ -382,12 +398,27 @@ wss.on('connection', (ws) => {
       console.log(`[WS] Extension déconnectée (${extensionClients.size} restantes)`);
     }
 
+    if (ws.clientType === 'browser_worker' && ws.workerId) {
+      const worker = browserWorkers.get(ws.workerId);
+      if (worker?.currentJobId) {
+        const job = jobs.get(worker.currentJobId);
+        if (job && job.status === 'processing') {
+          job.status = 'queued'; job.workerId = null; job.workerSocket = null; job.startedAt = null;
+          console.log(`[QUEUE] Tâche ${job.id} remise en file après déconnexion de ${ws.workerId}`);
+        }
+      }
+      browserWorkers.delete(ws.workerId);
+      console.log(`[WS] ${ws.workerId} déconnecté (${browserWorkers.size} extensions de traitement restantes)`);
+      dispatchNextJob();
+    }
     if (ws.clientType === 'mobile' && ws.mobileId) {
       const mobile = mobileClients.get(ws.mobileId);
       if (mobile?.currentJobId) {
         const job = jobs.get(mobile.currentJobId);
         if (job && job.status === 'processing') {
           job.status = 'queued';
+          job.workerId = null;
+          job.workerSocket = null;
           job.mobileId = null;
           job.mobileSocket = null;
           job.startedAt = null;
