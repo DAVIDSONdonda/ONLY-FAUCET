@@ -13,7 +13,9 @@ const jobs = new Map();
 const mobileClients = new Map();
 const browserWorkers = new Map();
 const extensionClients = new Set();
-const expiredJobTargets = new Map();
+// Les onglets connus sont conservés indépendamment des tâches pour permettre
+// un rechargement manuel, sans conserver de tâche expirée.
+const knownExtensionTargets = new Map();
 
 let nextMobileNumber = 1;
 
@@ -41,7 +43,7 @@ function getFirstQueuedJob() {
 
 function getFreeWorker(pool) {
   for (const client of pool.values()) {
-    if (client.ws.readyState === WebSocket.OPEN && client.currentJobId === null && client.awaitingReload === false) return client;
+    if (client.ws.readyState === WebSocket.OPEN && client.currentJobId === null) return client;
   }
   return null;
 }
@@ -103,28 +105,60 @@ function queueStats() {
   };
 }
 
+function collectReloadTargets() {
+  const targets = new Map();
+  for (const job of jobs.values()) {
+    if (job.extensionSocket && job.extensionTabId != null) {
+      targets.set(`${job.extensionSocket._onlyTargetId || ''}:${job.extensionTabId}`, {
+        socket: job.extensionSocket,
+        tabId: job.extensionTabId
+      });
+    }
+  }
+  for (const target of knownExtensionTargets.values()) {
+    if (target.socket && target.tabId != null) {
+      targets.set(`${target.socket._onlyTargetId || ''}:${target.tabId}`, target);
+    }
+  }
+  return [...targets.values()];
+}
+
+function reloadAllKnownPages() {
+  const targets = collectReloadTargets();
+  let reloaded = 0;
+  for (const target of targets) {
+    if (sendJson(target.socket, { type: 'reload_page', tabId: target.tabId })) {
+      reloaded += 1;
+    }
+  }
+  return reloaded;
+}
+
+function cancelAllJobs() {
+  let cancelled = 0;
+  for (const job of jobs.values()) {
+    clearTimeout(job.expireTimer);
+    const pool = job.processingTarget === 'extension' ? browserWorkers : mobileClients;
+    const worker = job.workerId ? pool.get(job.workerId) : null;
+    if (worker && worker.currentJobId === job.id) {
+      worker.currentJobId = null;
+      sendJson(worker.ws, { type: 'job_cancelled', id: job.id });
+    }
+    sendJson(job.extensionSocket, { type: 'job_cancelled', id: job.id });
+    jobs.delete(job.id);
+    cancelled += 1;
+  }
+  return cancelled;
+}
+
 function expireJob(jobId) {
   const job = jobs.get(jobId);
   if (!job) return;
-
-  if (job.extensionSocket && job.extensionTabId != null) {
-    const target = {
-      socket: job.extensionSocket,
-      tabId: job.extensionTabId
-    };
-    expiredJobTargets.set(job.id, target);
-    setTimeout(() => {
-      if (expiredJobTargets.get(job.id) === target) {
-        expiredJobTargets.delete(job.id);
-      }
-    }, 5 * 60 * 1000);
-  }
 
   const pool = job.processingTarget === 'extension' ? browserWorkers : mobileClients;
   const worker = job.workerId ? pool.get(job.workerId) : null;
   if (worker && worker.currentJobId === job.id) {
     worker.currentJobId = null;
-    worker.awaitingReload = true;
   }
 
   sendJson(job.extensionSocket, {
@@ -228,7 +262,7 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'register_browser_worker') {
         const workerId = `browser_${browserWorkers.size + 1}_${Date.now()}`;
-        const worker = { id: workerId, ws, currentJobId: null, awaitingReload: false, connectedAt: new Date().toISOString() };
+        const worker = { id: workerId, ws, currentJobId: null, connectedAt: new Date().toISOString() };
         ws.clientType = 'browser_worker';
         ws.workerId = workerId;
         browserWorkers.set(workerId, worker);
@@ -243,7 +277,6 @@ wss.on('connection', (ws) => {
           id: mobileId,
           ws,
           currentJobId: null,
-          awaitingReload: false,
           connectedAt: new Date().toISOString()
         };
 
@@ -289,6 +322,13 @@ wss.on('connection', (ws) => {
           startedAt: null,
           expireTimer: null
         };
+
+        if (job.extensionTabId != null) {
+          knownExtensionTargets.set(`${ws._onlyTargetId || ''}:${job.extensionTabId}`, {
+            socket: ws,
+            tabId: job.extensionTabId
+          });
+        }
 
         jobs.set(id, job);
         job.expireTimer = setTimeout(() => expireJob(id), JOB_TTL_MS);
@@ -351,27 +391,16 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      if (data.type === 'reload_extension_page') {
-        const target = expiredJobTargets.get(data.id);
-        if (!target || target.socket.readyState !== WebSocket.OPEN) {
-          sendJson(ws, {
-            type: 'error',
-            id: data.id,
-            error: 'Extension introuvable pour cette tâche expirée'
-          });
-          return;
-        }
+      if (data.type === 'cancel_all_jobs') {
+        const cancelled = cancelAllJobs();
+        sendJson(ws, { type: 'all_jobs_cancelled', cancelled });
+        dispatchNextJob();
+        return;
+      }
 
-        sendJson(target.socket, {
-          type: 'reload_page',
-          id: data.id,
-          tabId: target.tabId
-        });
-        expiredJobTargets.delete(data.id);
-        const workerPool = ws.clientType === 'browser_worker' ? browserWorkers : mobileClients;
-        const worker = ws.workerId ? workerPool.get(ws.workerId) : null;
-        if (worker) worker.awaitingReload = false;
-        sendJson(ws, { type: 'reload_requested', id: data.id });
+      if (data.type === 'reload_all_pages') {
+        const reloaded = reloadAllKnownPages();
+        sendJson(ws, { type: 'all_pages_reloaded', reloaded });
         dispatchNextJob();
         return;
       }
@@ -394,6 +423,9 @@ wss.on('connection', (ws) => {
       extensionClients.delete(ws);
       for (const job of jobs.values()) {
         if (job.extensionSocket === ws) job.extensionSocket = null;
+      }
+      for (const [key, target] of knownExtensionTargets.entries()) {
+        if (target.socket === ws) knownExtensionTargets.delete(key);
       }
       console.log(`[WS] Extension déconnectée (${extensionClients.size} restantes)`);
     }
