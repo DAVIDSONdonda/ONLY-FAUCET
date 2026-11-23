@@ -484,3 +484,4 @@ wss.on('close', () => clearInterval(heartbeatInterval));
 server.listen(PORT, HOST, () => {
   console.log(`Serveur WebSocket FIFO démarré sur ${HOST}:${PORT}`);
 });
+ 
